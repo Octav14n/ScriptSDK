@@ -8,6 +8,8 @@ using System.Threading;
 using System.IO;
 using System.Reflection;
 using System.Media;
+using System.Net;
+using System.Net.Sockets;
 using ScriptSDK.Data;
 
 #pragma warning disable 1591
@@ -880,17 +882,37 @@ namespace StealthAPI
 
         private Stealth()
         {
+            AddTraceMessage("Prepare message for Stealth", "Stealth.Main");
+            string procstring = Process.GetCurrentProcess().Id.ToString("X8") + System.AppDomain.CurrentDomain.FriendlyName + '\0';
+            AddTraceMessage(string.Format("Procstring: {0}", procstring), "Stealth.Main");
+            int port = 0;
+            if (IsWindows)
+                port = GetPortWindows(procstring);
+            else
+                port = GetPortProxy(procstring);
+            _isStopped = false;
+
+            AddTraceMessage("Create Stealth client", "Stealth.Main");
+            _client = new StealthClient("localhost", port);
+            _client.ServerEventRecieve += cln_ServerEventRecieve;
+            _client.StartStopRecieve += _client_StartStopRecieve;
+            _client.TerminateRecieve += _client_TerminateRecieve;
+            _client.Connect();
+            var about = GetStealthInfo();
+            new Version(about.StealthVersion[0], about.StealthVersion[1], about.StealthVersion[2], about.GITRevNumber);
+            //if (ver < SUPPORTED_VERSION)
+            //    throw new NotSupportedException("Support Stealth version 6.5.3 rev 847 or above");
+        }
+
+        private int GetPortWindows(string procstring)
+        {
             Win32.NativeMessage msg;
             uint value = 0x600;
             Win32.PeekMessage(out msg, 0, value, value, Win32.PM_REMOVE);
-
-            AddTraceMessage("Prepare message for Stealth", "Stealth.Main");
-            var procstring = Process.GetCurrentProcess().Id.ToString("X8") + Process.GetCurrentProcess().MainModule.FileName.Replace(".vshost", "") + '\0';
-            AddTraceMessage(string.Format("Procstring: {0}", procstring), "Stealth.Main");
             var aCopyData = new Win32.CopyDataStruct
             {
                 dwData = (uint)Win32.GetCurrentThreadId(),
-                cbData = Process.GetCurrentProcess().MainModule.FileName.Replace(".vshost", "").Length + 8 + 1,
+                cbData = procstring.Length,
                 lpData = Marshal.StringToHGlobalAnsi(procstring)
             };
 
@@ -924,19 +946,45 @@ namespace StealthAPI
                 Marshal.FreeHGlobal(copyDataPtr);
             }
 
-            int port = (int)(msg.wParam);
-            _isStopped = false;
+            return (int)(msg.wParam);
+        }
 
-            AddTraceMessage("Create Stealth client", "Stealth.Main");
-            _client = new StealthClient("localhost", port);
-            _client.ServerEventRecieve += cln_ServerEventRecieve;
-            _client.StartStopRecieve += _client_StartStopRecieve;
-            _client.TerminateRecieve += _client_TerminateRecieve;
-            _client.Connect();
-            var about = GetStealthInfo();
-            new Version(about.StealthVersion[0], about.StealthVersion[1], about.StealthVersion[2], about.GITRevNumber);
-            //if (ver < SUPPORTED_VERSION)
-            //    throw new NotSupportedException("Support Stealth version 6.5.3 rev 847 or above");
+        private int GetPortProxy(string procstring)
+        {
+            // Non-Windows Systems need a proxy program to handle the Win32 system calls. (running in WINE)
+            TcpClient client = new TcpClient();
+            client.Connect (IPAddress.Loopback, 18084);
+            NetworkStream stream = client.GetStream();
+            BinaryWriter writer = new BinaryWriter(stream);
+            BinaryReader reader = new BinaryReader(stream);
+            int port = 0;
+            try
+            {
+                writer.Write(procstring);
+                port = reader.ReadInt32();
+            }
+            finally
+            {
+                reader.Close();
+                writer.Close();
+                stream.Close();
+                client.Close();
+            }
+            return port;
+        }
+
+        private bool IsWindows
+        {
+            get
+            {
+                PlatformID plat = Environment.OSVersion.Platform;
+                return (
+                    plat == PlatformID.Win32NT ||
+                    plat == PlatformID.Win32S ||
+                    plat == PlatformID.Win32Windows ||
+                    plat == PlatformID.WinCE
+                );
+            }
         }
 
         ~Stealth()
